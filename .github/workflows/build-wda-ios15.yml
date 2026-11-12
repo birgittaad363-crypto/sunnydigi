@@ -1,0 +1,78 @@
+name: Build WDA for iOS 15.5 (experimental)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 40
+    steps:
+      - name: Check out WebDriverAgent source
+        uses: actions/checkout@v4
+        with:
+          repository: appium/WebDriverAgent
+          ref: master
+          persist-credentials: false
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Build unsigned iPhone test runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild build-for-testing \
+            -project WebDriverAgent.xcodeproj \
+            -scheme WebDriverAgentRunner \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$GITHUB_WORKSPACE/build" \
+            IPHONEOS_DEPLOYMENT_TARGET=15.0 \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            2>&1 | tee "$GITHUB_WORKSPACE/wda-build.log"
+
+      - name: Verify actual runner and iOS requirements
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_PATH=$(find "$GITHUB_WORKSPACE/build/Build/Products" -type d -name 'WebDriverAgentRunner-Runner.app' -print -quit)
+          test -n "$APP_PATH"
+          test -f "$APP_PATH/Info.plist"
+          echo "Runner path: $APP_PATH"
+          /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$APP_PATH/Info.plist"
+          export APP_PATH
+          python3 - <<'PY'
+          import os, plistlib
+          with open(os.path.join(os.environ["APP_PATH"], "Info.plist"), "rb") as f:
+              plist = plistlib.load(f)
+          version = tuple(int(x) for x in plist.get("MinimumOSVersion", "99.0").split(".")[:2])
+          print("App minimum iOS:", plist.get("MinimumOSVersion"))
+          if version > (15, 5):
+              raise SystemExit("Runner requires newer iOS than 15.5")
+          PY
+          mkdir -p output/Payload
+          cp -R "$APP_PATH" output/Payload/
+          (cd output && zip -qry WebDriverAgent-unsigned-experimental.ipa Payload)
+          cp -R "$GITHUB_WORKSPACE/build/Build/Products" output/BuildProducts
+          echo "Unsigned .ipa is an experimental packaging format; signing alone may not launch XCTest runner." > output/IMPORTANT.txt
+
+      - name: Upload unsigned outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: WDA-iOS15-unsigned-test-build
+          path: output/
+          if-no-files-found: error
+
+      - name: Upload build log when failed
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: WDA-build-diagnostics
+          path: wda-build.log
+          if-no-files-found: ignore
